@@ -1,0 +1,204 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Actions\Invoices\AllocatePayment;
+use App\Actions\Payments\RecordPayment;
+use App\Business\Payments\PaymentStatusValidator;
+use App\Data\Payment\RecordPaymentData;
+use App\Enums\PaymentStatus;
+use App\Events\Payment\PaymentRecorded;
+use App\Events\Payment\PaymentStatusChanged;
+use App\Exceptions\PaymentOverflowException;
+use App\Http\Requests\Payment\StorePaymentRequest;
+use App\Models\Invoice;
+use App\Models\Lease;
+use App\Models\Media;
+use App\Models\Payment;
+use App\Models\PaymentProof;
+use App\Services\Payments\MoneyConverter;
+use Brick\Math\BigDecimal;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
+use Inertia\Inertia;
+use OpenKOS\Core\Events\PaymentRecorded as PlatformPaymentRecorded;
+use Symfony\Component\HttpFoundation\StreamedResponse;
+
+class PaymentController extends Controller
+{
+    public function store(StorePaymentRequest $request, Lease $lease, RecordPayment $action): RedirectResponse
+    {
+        $this->authorize('create', [Payment::class, $lease]);
+
+        $request->ensureLeaseIsActive();
+
+        $invoice = Invoice::findOrFail($request->invoice_id);
+        $request->ensureInvoiceIsPayable($invoice);
+
+        $data = new RecordPaymentData(
+            amount: (string) $request->amount,
+            paymentDate: $request->paid_at,
+            paymentMethod: $request->payment_method,
+            notes: $request->notes,
+            proof: $request->file('proof'),
+        );
+
+        try {
+            $result = $action->execute($invoice, $data, $request->user());
+        } catch (PaymentOverflowException) {
+            abort(422, __('Payment exceeds the invoice outstanding balance.'));
+        }
+
+        if ($result->failed()) {
+            abort(422, $result->error);
+        }
+
+        $payment = $result->payment;
+
+        PaymentRecorded::dispatch($payment, actorId: Auth::id());
+        event(new PlatformPaymentRecorded(paymentId: $payment->getKey(), actorId: Auth::id()));
+
+        Inertia::flash('toast', [
+            'type' => 'success',
+            'message' => __('Payment of :amount recorded for :period.', [
+                'amount' => $payment->amount.' '.$payment->currency,
+                'period' => $invoice->period_start->format('F Y'),
+            ]),
+        ]);
+
+        return back();
+    }
+
+    public function proof(Payment $payment, PaymentProof $proof): StreamedResponse
+    {
+        $this->authorize('view', $payment);
+        abort_if($proof->payment_id !== $payment->id, 404);
+
+        if ($proof->media_id !== null) {
+            $media = $this->canonicalMedia($payment, $proof);
+
+            $storage = Storage::disk($media->disk);
+            abort_unless($storage->exists($media->path), 404);
+
+            return $storage->response($media->path, $media->original_name, [
+                'Content-Type' => $media->mime_type,
+            ]);
+        }
+
+        $storage = Storage::disk('local');
+        abort_unless($storage->exists($proof->path), 404);
+
+        return $storage->response($proof->path, $proof->original_name, [
+            'Content-Type' => $proof->mime_type,
+        ]);
+    }
+
+    private function canonicalMedia(Payment $payment, PaymentProof $proof): Media
+    {
+        $media = $proof->media;
+
+        abort_if(
+            $media === null
+                || $media->mediable_type !== $payment->getMorphClass()
+                || (string) $media->mediable_id !== (string) $proof->payment_id
+                || $media->collection !== 'proofs',
+            404,
+        );
+
+        return $media;
+    }
+
+    public function __construct(
+        private PaymentStatusValidator $paymentStatusValidator,
+        private AllocatePayment $allocatePayment,
+    ) {}
+
+    public function verify(Request $request, Payment $payment): RedirectResponse
+    {
+        $this->authorize('verify', $payment);
+
+        $request->validate([
+            'action' => ['required', 'string', 'in:confirm,reject'],
+        ]);
+
+        $newStatus = $request->action === 'confirm' ? PaymentStatus::Confirmed : PaymentStatus::Cancelled;
+        $oldStatus = $payment->status;
+
+        $this->paymentStatusValidator->validate($oldStatus, $newStatus);
+
+        // Both paths run under lock so a concurrent confirm cannot be silently
+        // overwritten by a reject (or vice versa).
+        DB::transaction(function () use ($payment, $request, $newStatus) {
+            // Lock Invoice first (consistent with RecordPayment order) to
+            // prevent deadlocks when both paths run concurrently.
+            $invoice = Invoice::lockForUpdate()->findOrFail($payment->invoice_id);
+            $lockedPayment = Payment::lockForUpdate()->findOrFail($payment->id);
+
+            if ($lockedPayment->status !== PaymentStatus::Pending) {
+                abort(422, __('Payment has already been verified.'));
+            }
+
+            if ($newStatus === PaymentStatus::Confirmed) {
+
+                $confirmedSum = (string) $invoice->payments()
+                    ->where('status', PaymentStatus::Confirmed->value)
+                    ->sum('amount');
+
+                if (app(MoneyConverter::class)->compare(
+                    BigDecimal::of($confirmedSum)->plus((string) $lockedPayment->amount)->toString(),
+                    (string) $invoice->total,
+                ) > 0) {
+                    abort(422, 'Confirming this payment would exceed the invoice total.');
+                }
+
+                $lockedPayment->update([
+                    'status' => $newStatus,
+                    'confirmed_by' => $request->user()->id,
+                    'verified_by' => $request->user()->id,
+                    'verified_at' => now(),
+                ]);
+
+                $this->allocatePayment->execute($lockedPayment);
+            } else {
+                $affectedInvoiceIds = $lockedPayment->allocations()
+                    ->pluck('invoice_id')
+                    ->push($lockedPayment->invoice_id)
+                    ->unique()
+                    ->values();
+
+                $lockedPayment->allocations()->delete();
+
+                $lockedPayment->update([
+                    'status' => $newStatus,
+                    'confirmed_by' => null,
+                    'verified_by' => $request->user()->id,
+                    'verified_at' => now(),
+                ]);
+
+                $affectedInvoices = Invoice::whereIn('id', $affectedInvoiceIds)
+                    ->lockForUpdate()
+                    ->get();
+
+                Invoice::recalculateStatuses($affectedInvoices);
+            }
+        });
+
+        $payment->refresh();
+
+        PaymentStatusChanged::dispatch($payment, $oldStatus, $newStatus, actorId: Auth::id());
+
+        $message = $request->action === 'confirm'
+            ? __('Payment verified successfully.')
+            : __('Payment rejected.');
+
+        Inertia::flash('toast', [
+            'type' => 'success',
+            'message' => $message,
+        ]);
+
+        return back();
+    }
+}
