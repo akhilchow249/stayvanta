@@ -27,4 +27,6 @@ if [ "$should_optimize" = true ] && [ "${LARAVEL_OPTIMIZE:-true}" = true ]; then
     php artisan optimize --ansi
 fi
 
+php artisan migrate --force --seed
+
 exec "$@"
