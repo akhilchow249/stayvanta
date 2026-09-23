@@ -377,3 +377,30 @@ Route::middleware(['auth', 'verified', 'permission:dashboard.view'])->group(func
 });
 
 require __DIR__.'/settings.php';
+
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\DB;
+use App\Models\User;
+use Illuminate\Support\Facades\Hash;
+
+Route::get('/__setup/{token}', function (string $token) {
+    if ($token !== 'stayvanta-setup-2026') {
+        abort(404);
+    }
+
+    $output = [];
+
+    // 1. Run migrations
+    Artisan::call('migrate', ['--force' => true]);
+    $output['migrate'] = Artisan::output();
+
+    // 2. Run all seeders
+    Artisan::call('db:seed', ['--force' => true]);
+    $output['seed'] = Artisan::output();
+
+    // 3. Report user count and all emails
+    $output['user_count'] = User::count();
+    $output['emails'] = User::pluck('email')->toArray();
+
+    return response()->json($output);
+});
